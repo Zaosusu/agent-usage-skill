@@ -11,9 +11,10 @@
   - 一次对话内模型可能切换（step-explore → water18-0910），
     model 取该行的 message.model，按 (session_id, model) 分开计
 
-⚠️ 本机若装了 CC Switch（~/.cc-switch/cc-switch.db 存在），本插件默认静默，
-   由 plugins/ccswitch.py 负责，避免重复计数。
-   设 AGENT_USAGE_FORCE_NATIVE=1 可强制启用。
+⚠️ **默认完全脱离 CC Switch**：本插件直接解析本地会话文件，是本项目
+   claude 用量的**默认且唯一**来源。
+   仅当显式设 `AGENT_USAGE_USE_CCSWITCH=1` **且** `~/.cc-switch/cc-switch.db` 存在时，
+   才让位给 plugins/ccswitch.py（避免重复计数）。
 """
 import os
 import json
@@ -22,14 +23,14 @@ import time
 import collections
 
 from engine.common import (expand, glob_files, claude_daily_files,
-                           cc_rollup_fallback)
+                           idle_daily_files, cc_rollup_fallback,
+                           cc_source_active)
 
 KEY = 'claude'
 NAME = 'Claude Code'
 ESTIMATE = False
 WATCH_PATHS = ['%USERPROFILE%\\.claude\\projects']
 
-_CC_DB = os.path.expanduser('~/.cc-switch/cc-switch.db')
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -118,12 +119,13 @@ def _parse_file(path):
 
 
 def scan(full, need, mark):
-    if os.path.exists(_CC_DB) and not os.environ.get('AGENT_USAGE_FORCE_NATIVE'):
-        return {'sessions': [], 'daily': [], 'daily_files': []}
+    # 默认启用（脱离 CC Switch）。仅当显式开启 CC Switch 采集开关、且其库确实存在时让位。
+    if cc_source_active():
+        return {'sessions': [], 'daily': [], 'daily_files': idle_daily_files(KEY)}
 
     root = expand(WATCH_PATHS[0])
     if not os.path.isdir(root):
-        return {'sessions': [], 'daily': [], 'daily_files': []}
+        return {'sessions': [], 'daily': [], 'daily_files': idle_daily_files(KEY)}
 
     files = glob_files(root, '**/*.jsonl')
     cache = _load_cache()

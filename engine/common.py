@@ -147,15 +147,50 @@ def scan_jsonl_dir(root, pattern, parse_fn, full, need, mark):
     return out
 
 
-# ---------- CC Switch 长期汇总表（可选的「历史兜底」数据源） ----------
-# 背景：cc-switch 的 proxy_request_logs 只保留近 30 天明细，
-#       30 天前会滚进 usage_daily_rollups（每日×模型汇总，长期保留）。
-# 本地 rollout / projects 文件若被清理，这段历史就只剩 rollup 有。
-# 原生插件（codex.py / claude.py）用本函数做**日级兜底**：
-#   本地文件已覆盖的日期以本地为准，本地没有的日期用 rollup 补。
+# ---------- 数据源开关：默认完全脱离 CC Switch ----------
+# 设计原则（2026-09-28 定）：
+#   **本项目默认不依赖 CC Switch。** codex / claude 由原生插件直接解析本地会话文件
+#   （~/.codex/sessions/**、~/.claude/projects/**），无需任何第三方代理。
+#   CC Switch 只是**可选**的替代来源，必须显式开启才会使用。
+#
+#   AGENT_USAGE_USE_CCSWITCH=1     改用 CC Switch 代理库采集 codex/claude
+#                                  （原生插件自动让位，避免双计）
+#   AGENT_USAGE_NO_CC_BACKFILL=1   连 rollup 历史兜底也不用 ⇒ 零 CC 接触
+#
+# 三者都不设（默认）⇒ 纯原生采集，行为与「机器上从未装过 CC Switch」完全一致。
 CC_SWITCH_DB = os.path.expanduser('~/.cc-switch/cc-switch.db')
 CODEX_ROOT = os.path.expanduser('~/.codex/sessions')
 CLAUDE_ROOT = os.path.expanduser('~/.claude/projects')
+
+_TRUTHY = ('1', 'true', 'yes', 'on')
+
+
+def _env_flag(name):
+    return os.environ.get(name, '').strip().lower() in _TRUTHY
+
+
+def use_ccswitch():
+    """是否用 CC Switch 作为 codex/claude 的采集源。**默认 False（脱离 CC Switch）**。"""
+    return _env_flag('AGENT_USAGE_USE_CCSWITCH')
+
+
+def cc_source_active():
+    """CC Switch 是否真的在当班（开启开关 **且** 库确实存在）。
+
+    ⚠️ 必须同时判「库存在」：若只判开关，用户开了 `AGENT_USAGE_USE_CCSWITCH=1`
+    但库里没有数据（如已卸载、或路径不对），原生插件会静默让位、ccswitch 又空转
+    ⇒ **两边都不产出，数据全丢**。加上存在性判断后，这种情况自动回退到原生。
+    """
+    return use_ccswitch() and os.path.exists(CC_SWITCH_DB)
+
+
+def allow_cc_backfill():
+    """是否允许读 cc-switch 的 rollup 表做**历史差额兜底**。默认允许。
+
+    这是纯可选的增益：仅在 cc-switch.db 存在、且本地文件缺该日期时补差额；
+    文件不存在时无任何副作用。要求零 CC 接触时设 `AGENT_USAGE_NO_CC_BACKFILL=1`。
+    """
+    return not _env_flag('AGENT_USAGE_NO_CC_BACKFILL')
 
 
 def _np(p):
@@ -176,6 +211,32 @@ def codex_daily_files():
 def claude_daily_files():
     """claude 这个 agent 名下所有可能 source_file 的全集（同上）。"""
     return [_np(CLAUDE_ROOT), _np(CC_SWITCH_DB), _np(CC_SWITCH_DB) + '#rollup']
+
+
+# ---------- 清理清单的「在岗 / 空转」双档语义 ----------
+# 插件执行有固定先后（按 key 排序：ccswitch < claude < codex），core 对每个返回的
+# daily_files 都执行「先删后插」（删除范围限定 agent 属于该插件自己的 key）。
+#
+#   在岗（本轮真的产出了数据）→ 返回 codex_daily_files()/claude_daily_files()
+#       「共用清单」：既清自己的本地行，也清对方（CC）名下的历史行，
+#       因为历史上前者可能记过同一份数据（跨来源切换必须双向清理，否则叠加）。
+#
+#   空转（本轮不产出，如未开开关、或本地目录不存在）→ 用 idle_daily_files()
+#       ① CC 在岗时 → 返回 []：本插件排在 ccswitch **之后**执行，
+#          若此时返回共用清单，会把 ccswitch 刚插入的行顺手删光（先删后插所致）。
+#       ② CC 不在岗时 → 返回该 agent 的共用清单：清掉「CC 部落」的历史残留。
+#          这是必要的兜底 —— 例如本机从没用过 codex 原生 CLI（目录不存在），
+#          但历史 CC 模式留下过 codex 的 CC 明细行；若不清理，切换后
+#          codex 的 CC 残留行会一直虚高，且没有任何插件会去删它。
+def idle_daily_files(agent):
+    """空转插件该上报的清理清单（见上方双档语义）。"""
+    if cc_source_active():
+        return []
+    if agent == 'codex':
+        return codex_daily_files()
+    if agent == 'claude':
+        return claude_daily_files()
+    return []
 
 
 def cc_rollup_rows(app_type):
@@ -232,6 +293,8 @@ def cc_rollup_fallback(agent, local_by_day):
     """
     import collections
     import time as _t
+    if not allow_cc_backfill():
+        return [], []
     rollup = cc_rollup_rows(agent)
     if not rollup:
         return [], []

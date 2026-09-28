@@ -20,10 +20,10 @@
     ⇒ 同一会话切换模型时会拆成多条（gpt-5.6-sol → gpt-6-sol），
       这正是 CC Switch 按 (agent, session_id) 聚合时会丢模型的原因
 
-⚠️ 本机若装了 CC Switch（~/.cc-switch/cc-switch.db 存在），本插件默认静默，
-   由 plugins/ccswitch.py 负责，避免同一份数据被两个插件重复计数。
-   设环境变量 AGENT_USAGE_FORCE_NATIVE=1 可强制启用本插件（此时建议同时
-   禁用 ccswitch 插件，否则会双计）。
+⚠️ **默认完全脱离 CC Switch**：本插件直接解析本地 rollout 文件，是本项目
+   codex 用量的**默认且唯一**来源。
+   仅当显式设 `AGENT_USAGE_USE_CCSWITCH=1` **且** `~/.cc-switch/cc-switch.db` 存在时，
+   才让位给 plugins/ccswitch.py（避免同一份数据双计）。
 """
 import os
 import json
@@ -32,14 +32,14 @@ import time
 import collections
 
 from engine.common import (expand, glob_files, codex_daily_files,
-                           cc_rollup_fallback)
+                           idle_daily_files, cc_rollup_fallback,
+                           cc_source_active)
 
 KEY = 'codex'
 NAME = 'Codex'
 ESTIMATE = False
 WATCH_PATHS = ['%USERPROFILE%\\.codex\\sessions']
 
-_CC_DB = os.path.expanduser('~/.cc-switch/cc-switch.db')
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -166,13 +166,16 @@ def _scan_cwd_map(root):
 
 
 def scan(full, need, mark):
-    # CC Switch 在岗时让位（避免两个插件对同一份数据重复计数）
-    if os.path.exists(_CC_DB) and not os.environ.get('AGENT_USAGE_FORCE_NATIVE'):
-        return {'sessions': [], 'daily': [], 'daily_files': []}
+    # 默认启用（脱离 CC Switch）。仅当显式开启 CC Switch 采集开关、且其库确实存在时让位。
+    if cc_source_active():
+        # CC 在岗：本插件空转（排在 ccswitch 之后执行，返回共用清单会误删其刚插入的行）。
+        return {'sessions': [], 'daily': [], 'daily_files': idle_daily_files(KEY)}
 
     root = expand(WATCH_PATHS[0])
     if not os.path.isdir(root):
-        return {'sessions': [], 'daily': [], 'daily_files': []}
+        # 本地目录不存在也必须上报清理清单：历史上 CC 模式可能留下过本 agent 的
+        # 行（source_file 指向 cc-switch.db），否则切换来源后这些残留行无人清理、总量虚高。
+        return {'sessions': [], 'daily': [], 'daily_files': idle_daily_files(KEY)}
 
     files = glob_files(root, '**/*.jsonl')
     cache = _load_cache()

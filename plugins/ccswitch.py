@@ -21,7 +21,7 @@ import json
 import glob
 import time
 import collections
-from engine.common import ro_connect
+from engine.common import ro_connect, cc_source_active
 
 KEY = 'ccswitch'
 NAME = 'CC Switch'
@@ -95,6 +95,20 @@ def _db_path():
 
 
 def scan(full, need, mark):
+    # ⚠️ 本项目**默认脱离 CC Switch**：本插件默认不产出任何数据，
+    #    codex/claude 由原生插件（plugins/codex.py、plugins/claude.py）
+    #    直接解析本地会话文件采集。
+    #    仅当显式设 AGENT_USAGE_USE_CCSWITCH=1 时，才启用本插件作为替代来源。
+    #
+    # 说明：空转时**不必**在此清理原本属于自己的历史行 ——
+    # 本插件上报的 agent 是 codex/claude（子 agent），而引擎的删除范围
+    # 按「插件 key」限定（见 core.scan 的 agents_in_rows），故此处返回任何
+    # 清单都删不到 codex/claude 名下由本插件写过的历史行。
+    # 真正负责清理这些残留的是：原生 codex/claude 插件空转时返回的
+    # idle_daily_files()（见 engine/common.py 与 plugins/codex.py）。
+    if not cc_source_active():
+        return {'sessions': [], 'daily': [], 'daily_files': []}
+
     dbp = _db_path()
     if not os.path.exists(dbp):
         return {'sessions': [], 'daily': [], 'daily_files': []}

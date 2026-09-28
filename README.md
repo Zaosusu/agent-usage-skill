@@ -30,8 +30,8 @@ agent-usage-skill.exe [--port 8765] [--no-open] [--interval 5] [--full]
 
 | Agent | 精确度 | 数据源 | 说明 |
 | --- | --- | --- | --- |
-| Codex | 精确 | **CC Switch**（在岗时）/ **本地 rollout 文件**（无 CC Switch 时） | 两套采集器**自动切换、静默共存**，见下方「没有 CC Switch 也能抓」 |
-| Claude Code | 精确 | **CC Switch**（在岗时）/ **`~/.claude/projects/**.jsonl`**（无 CC Switch 时） | 同上 |
+| Codex | 精确 | **本地 rollout 文件（默认）** / CC Switch（可选） | **默认脱离 CC Switch**，见下方「完全脱离 CC Switch」 |
+| Claude Code | 精确 | **本地 projects jsonl（默认）** / CC Switch（可选） | 同上 |
 | Kimi Code | 精确 | `~/.kimi/sessions/**/wire.jsonl` | 本地 wire 协议含 token_usage |
 | WorkBuddy | 精确 | `~/.workbuddy/projects/**/*.jsonl` | 每轮模型调用带 `usage`（prompt/completion/total_tokens），逐轮累加即真实计费量 |
 | CodeBuddy | 估算 | `~/.codebuddy/projects/**/*.jsonl` | 文本长度估算 |
@@ -54,23 +54,22 @@ WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个坑：
 不要用 `session_usage.credit_json` 折算 token：那是**费用**字段（元），
 与 token 的比值随模型费率浮动（实测 0.31x ~ 12.43x），且约 65% 的会话该字段为 NULL。
 
-### 没有 CC Switch 也能抓（Codex / Claude Code）
+### 完全脱离 CC Switch（默认行为）
 
-**本项目的 codex / claude 采集不依赖 CC Switch。** 两套采集器自动切换、静默共存：
+**本项目默认不依赖 CC Switch。** codex / claude 的用量由原生插件直接解析本地会话文件采集，
+不需要任何第三方代理，也不需要任何配置。**即使机器上装了 CC Switch，默认也不读它的库。**
 
-| 本机状态 | 实际采集器 | 数据源 |
-| --- | --- | --- |
-| 装了 CC Switch（存在 `~/.cc-switch/cc-switch.db`） | `plugins/ccswitch.py` | 代理库明细 + 长期汇总 |
-| **没装 CC Switch**（朋友机器 / 已卸载） | `plugins/codex.py` + `plugins/claude.py` | **直接解析本地会话文件** |
-
-判据就是「文件存不存在」，无需任何配置。原生插件在 CC 在岗时**默认静默**（不产出任何行），
-避免同一份数据被两个插件重复计数；设 `AGENT_USAGE_FORCE_NATIVE=1` 可强制启用（此时建议同时禁用 ccswitch）。
+| 环境变量 | 作用 |
+| --- | --- |
+| *（都不设，默认）* | **纯原生采集** —— 直接读 `~/.codex/sessions/**`、`~/.claude/projects/**` |
+| `AGENT_USAGE_USE_CCSWITCH=1` | 可选：改用 CC Switch 代理库采集（原生插件自动让位，避免双计） |
+| `AGENT_USAGE_NO_CC_BACKFILL=1` | 连 rollup 历史兜底也不用 ⇒ **零 CC 接触** |
 
 **为什么能替代**：CC Switch 本身就是「解析本地会话文件」的 —— 它的
 `proxy_request_logs.data_source` 字段值就是 `codex_session` / `session_log`，
 `request_id` 形如 `codex_session:<sid>:<seq>`。实测 CC 的 26397 条 codex 明细行
 **99.94% 精确命中本地 rollout 文件**、431 条 claude 行 **100% 命中本地 `message.id`**。
-所以它不产生数据，只是转发本地数据；我们照做即可。
+所以它不产生数据，只是转发本地数据。
 
 **原生采集口径**：
 
@@ -87,14 +86,40 @@ WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个坑：
 
 | | 原生本地采集 | CC Switch | 结果 |
 | --- | --- | --- | --- |
-| Codex | **358.8 亿** | 266.1 亿 | 原生多 **34.8%**——CC 只覆盖 32 个会话，本地有 237 个（漏采 84%） |
+| Codex | **358.8 亿** | 266.2 亿 | 原生多 **34.8%**——CC 只覆盖 32 个会话，本地有 237 个（漏采 84%） |
 | Claude Code | 6.40 亿 | 6.40 亿 | **基本一致**（人机验证口径吻合） |
 
-即：**没有 CC Switch 不但能抓，Codex 还抓得更全。**
+即：**脱离 CC Switch 不但能抓，Codex 还抓得更全。**
 
-> rollup 兜底：若本机残留过 `cc-switch.db`（哪怕后来卸载），其 `usage_daily_rollups`
-> 长期汇总表仍可用来补本地文件已清掉的历史差额（独立 `source_file` 前缀 `#rollup` 隔离，绝不与本地行相加）。
+**一个安全兜底**：若开了 `AGENT_USAGE_USE_CCSWITCH=1` 但 `cc-switch.db` 实际不存在
+（已卸载、或路径不对），原生插件会**自动接管**，不会出现「两边都不产出、数据全丢」。
+判据是「开关 **且** 库存在」，两者同时成立才让位。
+
+> **rollup 历史兜底**：若本机残留过 `cc-switch.db`（哪怕后来卸载），其
+> `usage_daily_rollups` 长期汇总表仍可用来补本地文件已清掉的历史差额
+> （独立 `source_file` 前缀 `#rollup` 隔离，绝不与本地行相加）。
+> 要完全零 CC 接触就设 `AGENT_USAGE_NO_CC_BACKFILL=1`。
 > 全新机器没有这份兜底，只能采本地文件现有的范围——这是正常且正确的行为。
+
+**切换来源时的残留清理**（重要，否则总量虚高）：
+
+插件的清理清单分「在岗 / 空转」两档，判据见 `engine/common.py` 的 `idle_daily_files()`：
+
+| 插件状态 | 返回的清理清单 | 原因 |
+| --- | --- | --- |
+| 在岗（产出了数据） | 该 agent 的**共用清单** `codex_daily_files()`/`claude_daily_files()` | 跨来源切换必须双向清理，否则原生行与 CC 行叠加 |
+| 空转 + **CC 不在岗** | 同样返回共用清单 | 清掉历史「CC 部落」残留行；即使本地目录不存在也要清 |
+| 空转 + **CC 在岗** | `[]` | 本插件排在 `ccswitch` **之后**执行，返回共用清单会误删它刚插入的行 |
+
+> 为什么空转也要清理：`core.scan` 对每个上报的 `daily_files` 都执行「先删后插」，
+> 而删除范围按 agent 限定。若本机从「CC 模式」切回「默认原生」，CC 明细行
+> （`source_file` 指向 `cc-switch.db`）只有原生插件会去清；若原生插件因目录不存在
+> 而早退且不上报清单，这些残留行会**永久躺着**、与本地行叠加虚高
+> （实测曾导致 555 亿的虚高，本地真实量 359 亿）。
+
+**回归测试**：`python tools/test_native_parity.py`
+覆盖 6 个场景：① 默认脱离（**CC 库存在也不读**）② 显式启用 CC ③ 开关空转自动回退
+④ 零 CC 接触 ⑤ 双向切换无残留 ⑥ CC 残留行兜底清理（本地目录不存在也要清）。
 
 ### CC Switch 口径说明（踩坑记录）
 
@@ -228,6 +253,23 @@ engine/
 plugins/        各 Agent 适配器
 web/            ECharts 看板
 ```
+
+## 调试铁律
+
+**改完插件代码，必须先重启 `serve.py`，再判断数据对不对。**
+
+`serve.py` 是常驻进程，且内置 `Watcher`（默认每 5 秒检测数据源变化 → 自动扫描入库）。
+Python 进程**不会热加载**已 import 的模块，所以：
+
+- 你改了 `plugins/*.py` 后，老进程仍在跑**旧代码**，并持续往 `usage.db` 写旧口径的数据；
+- 此时你用命令行单独跑一次扫描，会看到「明明新代码删掉了 A，A 却还在，数值甚至还在涨」
+  —— 因为老进程在你删完后**又写回去了**。这不是代码 bug，是**并发写入的假象**。
+- 判断方法：看 `source_file` 的行是否在扫描间隔（默认 5s）内自行变化。
+  会变 ⇒ 有另一个进程在写 ⇒ 先重启服务再排查。
+
+本次就踩了这个坑：默认脱离 CC 后总量虚高到 555 亿，一度怀疑清理键不匹配，
+实际是 19:xx 启动的老 `serve.py` 一直在用旧代码回写 CC 明细行。
+**杀掉重启后，残留行一次性清干净，总量回落到 509.6 亿（本地真实量）+ 历史 rollup 差额。**
 
 ## 兜底方案
 
