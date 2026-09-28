@@ -12,6 +12,7 @@
   4 零接触   —— AGENT_USAGE_NO_CC_BACKFILL=1：连 rollup 兜底也不用
   5 切换     —— 同一个库：原生 ↔ CC 来回切，无残留、不叠加
   6 残留兜底 —— CC 模式留下的残留行，即使本地目录不存在也必须被清掉 ★
+  7 无CC纯原生 —— 全新用户机器上压根没装 CC Switch：必须纯原生采到数据、0 CC 行 ★
 
 用法：
     python tools/test_native_parity.py        # 跑全部
@@ -328,6 +329,44 @@ def s6_idle_cleanup():
     return ok
 
 
+# ----------------------------------------- 场景 7：无 CC Switch 纯原生 ★
+
+def s7_clean_no_cc():
+    """全新用户视角：机器上压根没装 CC Switch，克隆仓库直接跑。
+
+    这是"别人没有 CC Switch 也能完美拿到数据"的核心断言：
+      ① ccswitch 必须 0 行 —— 不读不存在的库、不报错、不抛异常
+      ② codex / claude 走原生插件解析本地会话文件，**必须有数据**
+      ③ 库内 session 表不得出现任何 CC 明细残留行（非 rollup）—— 防虚高
+    临时 DATA_DIR + 临时隐藏 CC 库路径，零风险（不改生产库、不动真实 CC 文件）。
+    """
+    print('=' * 68)
+    print('场景 7：全新用户（无 CC Switch、库不存在）—— 纯原生采集，不依赖 CC ★')
+    work = tempfile.mkdtemp(prefix='au_s7_')
+    ghost = os.path.join(work, 'gone', 'cc-switch.db')   # 不存在 ⇒ 模拟"没装 CC"
+    core = _boot(work, ghost)          # 不设任何 CC 开关
+    data, stats = core.scan(full=True, only=['codex', 'claude', 'ccswitch'])
+    t = _tot(data)
+    cc_up = stats.get('ccswitch', {}).get('upserted', -1)
+    cx_up = stats.get('codex', {}).get('upserted', 0)
+    cl_up = stats.get('claude', {}).get('upserted', 0)
+    print('  cc-switch.db 存在?', os.path.exists(ghost), '（应为 False）')
+    print('  ccswitch upserted =', cc_up, '  ← 必须 0（不读不存在的库）')
+    print('  原生 codex upserted =', cx_up, ' / claude =', cl_up,
+          '  ← 必须 > 0（纯本地会话文件）')
+    con = sqlite3.connect(os.path.join(work, 'usage.db'))
+    cc_detail = con.execute(
+        "select count(*) from sessions where source_file like '%cc-switch.db' "
+        "and source_file not like '%#rollup'").fetchone()[0]
+    con.close()
+    print('  库内 CC 明细残留(非rollup) =', cc_detail, '  ← 必须 0（防虚高）')
+    ok = (cc_up == 0 and cx_up > 0 and cl_up > 0 and cc_detail == 0)
+    print('  判定：' + ('无 CC Switch 也能纯原生完美采集 ✅'
+                        if ok else '❌ 无 CC 时数据异常'))
+    shutil.rmtree(work, ignore_errors=True)
+    return ok
+
+
 # ---------------------------------------------------------------- 主流程
 
 SCENARIOS = [
@@ -337,6 +376,7 @@ SCENARIOS = [
     ('4 零CC接触', s4_zero_touch),
     ('5 双向切换', s5_switch),
     ('6 残留兜底', s6_idle_cleanup),
+    ('7 无CC纯原生', s7_clean_no_cc),
 ]
 
 
