@@ -30,7 +30,7 @@ agent-usage-skill.exe [--port 8765] [--no-open] [--interval 5] [--full]
 
 | Agent | 精确度 | 数据源 | 说明 |
 | --- | --- | --- | --- |
-| Codex / Claude | 精确 | CC Switch `proxy_request_logs` | 代理层记录每次请求的 input/output/cache tokens |
+| Codex / Claude | 精确 | CC Switch `proxy_request_logs` + `usage_daily_rollups` | 代理层记录每次请求的 input/output/cache tokens。**两表互补必读**：明细表只保留近 30 天，30 天前的历史汇总在续期表，只读前者会丢全部历史 |
 | Kimi Code | 精确 | `~/.kimi/sessions/**/wire.jsonl` | 本地 wire 协议含 token_usage |
 | WorkBuddy | 精确 | `~/.workbuddy/projects/**/*.jsonl` | 每轮模型调用带 `usage`（prompt/completion/total_tokens），逐轮累加即真实计费量 |
 | CodeBuddy | 估算 | `~/.codebuddy/projects/**/*.jsonl` | 文本长度估算 |
@@ -52,6 +52,24 @@ WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个坑：
 
 不要用 `session_usage.credit_json` 折算 token：那是**费用**字段（元），
 与 token 的比值随模型费率浮动（实测 0.31x ~ 12.43x），且约 65% 的会话该字段为 NULL。
+
+### CC Switch 口径说明（踩坑记录）
+
+CC Switch 的源库 `~/.cc-switch/cc-switch.db` 是**双表互补**设计，两张表**都必须读**：
+
+| 表 | 覆盖范围 | 粒度 |
+| --- | --- | --- |
+| `proxy_request_logs` | **近 30 天**（滚动窗口，约 8/30 起） | 每次请求一行，含 `session_id` |
+| `usage_daily_rollups` | **30 天前**（长期保留，可回溯至 5 月） | 每日 × 模型汇总，**无 session_id** |
+
+只读明细表会**丢掉全部 30 天前的历史**（实测本机 codex 少算约 195 亿 token、
+模型数从 10 掉到 4，日曲线起点从 5/18 缩到 8/30）。两表时间范围互补、互不重叠，
+拼接时仍需按 `(agent, day)` 去重，防止将来窗口调整出现重叠日导致重复计数。
+
+另外：proxy 的 `session_id` 粒度 ≠ Codex 真正的会话粒度——同一个会话可能先后用多个模型
+（如 `gpt-5.6-sol` 切到 `gpt-6-sol`）共享同一 `session_id`。**聚合粒度必须到
+`(agent, session_id, model)`**，否则只按 `(agent, session_id)` 聚合会让后来的模型覆盖先前的，
+早期模型类型（如 `gpt-6-sol`）整个消失。
 
 ## 豆包工作插件
 
