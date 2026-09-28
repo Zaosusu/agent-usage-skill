@@ -5,7 +5,7 @@
 **本地与 API 都没有任何“绝对 token 数”字段**，无法做 1:1 硬锚点反推。
 所以系数只能靠「本地会话轨迹重建 ÷ 同批 timeline 百分比」来测。
 
-本脚本的核心是**消息级对齐法**（2026-09-21 复核后确立，取代了此前两个错误方法）：
+本脚本采用**消息级对齐法**（取代了此前两个被证伪的方法）：
 
   1. timeline 的每条记录 = 一条 user 消息（display_name 就是消息原文）
   2. 本地重建按**同一批消息**累加 token（一次 assistant 消息 = 一次模型调用，
@@ -26,11 +26,10 @@
 
 已作废的方法（不要再用）：
 - **IndexedDB 时间窗硬锚点（旧算法 G）**：把 IndexedDB 里的真实 token 与
-  「±5min 时间窗」内的 timeline 百分比相除。**已证伪**：窗口从 ±0 放宽到
-  ±60min，系数从 256 万漂到 6 万（40 倍漂移），说明分子分母不是同一批事件；
-  且该 IndexedDB 库里 `quota_source_code` 出现 0 次，「同额度池」无法证明；
-  那些记录时间集中在 01:46~01:59，是 memory 压缩批量落盘时刻，非真实调用时刻。
-- **tool schema 敏感性扫描**：tool schema 本地不落盘，5K/10K/20K 只是拍脑袋的
+  「±5min 时间窗」内的 timeline 百分比相除。**已证伪**：窗口稍一放宽，系数就
+  漂移数十倍 ⇒ 分子分母不是同一批事件；且该库里 `quota_source_code` 从未出现，
+  「同额度池」无法证明；记录时间集中在少数几分钟内，是批量落盘时刻而非调用时刻。
+- **tool schema 敏感性扫描**：tool schema 本地不落盘，K 值只是拍脑袋的
   假设值，会给结论引入假精度。现在改用消息级对齐，不再需要这个假设。
 """
 import os
@@ -53,7 +52,7 @@ from plugins.doubao import _extract_cookie, _fetch_timeline  # noqa: E402
 # doubao-seed-2-1-turbo / -pro 均为 256K（火山引擎官方套餐文档），
 # 本地配置里出现过的模型也只有这两个 256K 系列 + doubao-seed-character，
 # **没有任何 1M 窗口模型** ⇒ agent 模式每次调用都在 256K 内。
-# ⚠️ 早前此处按 128K 判决是错的：实测 max 上下文 240,688 本身就超 128K。
+# ⚠️ 必须按 256K 判决：agent 模式 max 上下文约 240K，本身即超 128K。
 WINDOW_TOKENS = 256 * 1024
 
 
@@ -100,10 +99,10 @@ def rebuild_sessions(root, verbose=True):
       - **一次 assistant 消息 = 一次模型调用**：消耗 = 该次请求的 input + output
         input = 此刻累积上下文（历史消息已含 tool result）+ system prompt
         output = 本条 assistant 内容
-      - ⚠️ **不要在 tool 消息处再额外加一次“上下文重放”**：工具结果已经进了 ctx，
+      - ⚠️ **不要在 tool 消息处再额外加一次"上下文重放"**：工具结果已经进了 ctx，
         下一次 assistant 调用的 input（ctx_before）里本就包含它。额外加一次等于
-        把同一份 input 算两遍，会系统性高估约 2 倍（2026-09-21 踩过：
-        改出 113.6 万 → 又派生出错误的 120 万）。
+        把同一份 input 算两遍，会系统性高估约 2 倍（据此曾误得 113.6 万，
+        又派生出错误的 120 万）。
       - system prompt 由调用方作为独立分量叠加（每次调用都要重发）。
 
     返回的 `by_key` 是消息级对齐法的分子：
@@ -137,12 +136,12 @@ def rebuild_sessions(root, verbose=True):
         cur_day = time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(fp)))
         cur_text = ''
         cur_tok = 0
-        # ⚠️ 两个曾经踩过的坑（2026-09-22 修）：
+        # ⚠️ 两个必须遵守的建模要求：
         #  1) **连续 user 消息算一个「工作单元」**：用户会连发短消息（"你看看"→"还是这个啊"），
-        #     模型只回一次，而 timeline 给每条都记一个 pct。旧实现把整轮的消耗全算给最后一条，
+        #     模型只回一次，而 timeline 给每条都记一个 pct。若把整轮的消耗全算给最后一条，
         #     前面的 key 拿到 pct 却 token=0 ⇒ 把系数系统性拽低约 2~4 倍。
         #     现在：单元内所有 key 均摊随后 assistant 调用的消耗，Σ(单元内各 key) = 单元总消耗。
-        #  2) **user 消息本身也是输入**，必须计入 ctx（旧实现漏了）。
+        #  2) **user 消息本身也是输入**，必须计入 ctx。
         open_keys = []
         burst_replied = False
         for ln in lines:
@@ -278,7 +277,7 @@ def workload_split(stats, timeline_entries):
 
     机制：agent 长任务里绝大部分 input 是**重复的累积上下文**，云端按缓存折扣计费，
     所以「同样 1%，长任务代表的原始 token 远多于短对话」。账户级系数只是混合平均，
-    不能当作「1% = X 万 token」的定律用（用户 2026-09-22 凭直觉命中了这一点）。
+    **不能当作「1% = X 万 token」的定律用**（单任务/单日推算是常见误用）。
 
     返回 dict(buckets=[(label,n,Σpct,Σtok,coef)], r=双对数相关系数)。
     """
@@ -418,7 +417,7 @@ def main():
         vis_mean = stats['call_cost_sys'] / n      # 可见单次总计（含 sys）
         k = m['tl_total'] / n                       # 单次均值 = 系数 × k
 
-        print(f'   实测 agent 模式单次「调用时上下文」：'
+        print(f'   agent 模式单次「调用时上下文」统计：'
               f'中位 {ctxs[n//2]:,} / p90 {ctxs[9*n//10]:,} / max {ctxs[-1]:,} / 均值 {avg_ctx:,.0f} tok')
         print(f'   可见单次总计（含 system prompt {sys_avg:,.0f}）: {vis_mean:,.0f} tok')
         print(f'   这是下限（未含 tool schema / 推理 token / 图片 / 非 agent 用量）')
@@ -456,11 +455,11 @@ def main():
             print(f'   {nm:<10}{c*m["tl_total"]/1e8:>9.2f} 亿{per:>11,.0f}'
                   f'{leak:>10,.0f}{max_real:>13,.0f}  {note}{mark}')
         print()
-        print(f'   读法：下界 = 可见消耗实测密度（漏算只会让真值更大，不可能更小）；')
+        print(f'   读法：下界 = 可见消耗的密度（漏算只会让真值更大，不可能更小）；')
         print(f'         上界 = max 调用占满窗口后，留给漏算的预算只有 {leak_budget:,.0f} tok/次。')
         hi_wan = int(coef_hi / 1e3) / 10          # 向下取，避免显示成"59 万"（实际已超窗）
         print(f'   ⇒ 系数上界 {hi_wan} 万/1%（能否定 120 万 / 230 万，但定不了真值）')
-        print(f'   ⚠️ 上界前提：2856 次调用 = 账户全部消耗；若有未落盘的调用，上界相应放宽。')
+        print(f'   ⚠️ 上界前提：本地统计到的调用数 = 账户全部消耗；若有未落盘的调用，上界相应放宽。')
         print(f'   ⚠️ 若将来发现 agent 会用 1M 窗口模型，此上界需放宽（当前本地无此证据）。')
 
     # ④ 已知偏差：推理 token 不可见（影响有界，需说明）
@@ -565,7 +564,7 @@ def _apply(value, reason):
     open(path, 'w', encoding='utf-8').write(new)
     print(f'[apply] 已写入 plugins/doubao.py : TOKENS_PER_PCT = {int(value)}')
     print(f'        依据：{reason}')
-    print('[!] 记得重启 serve（不重启 watcher 会用旧系数写回），并跑：')
+    print('[!] 记得重启 serve：常驻进程已加载旧模块，不重启的话 watcher 会用旧系数写回。')
     print('    python monitor.py scan --agents doubao --full')
 
 

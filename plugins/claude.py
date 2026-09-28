@@ -4,10 +4,10 @@
 数据源：%USERPROFILE%/.claude/projects/<编码路径>/<session-uuid>.jsonl
         以及同目录 <session-uuid>/subagents/agent-*.jsonl
 
-口径（与 CC Switch 对齐，实测 cc 的 request_id 100% 命中本地 message.id）：
+口径（与 CC Switch 对齐：cc 的 request_id 100% 命中本地 message.id）：
   - 只认 message.usage 存在的行（assistant 回复）
   - 按 message.id 去重：同一条回复会因流式/重试在多行重复出现，取首次
-    （实测 1467 条 usage 行 → 651 个唯一 id，不去重会虚高 2 倍以上）
+    （1467 条 usage 行只对应 651 个唯一 id，不去重会虚高 2 倍以上）
   - 一次对话内模型可能切换（step-explore → water18-0910），
     model 取该行的 message.model，按 (session_id, model) 分开计
 

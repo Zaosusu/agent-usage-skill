@@ -35,24 +35,24 @@ agent-usage-skill.exe [--port 8765] [--no-open] [--interval 5] [--full]
 | Kimi Code | 精确 | `~/.kimi/sessions/**/wire.jsonl` | 本地 wire 协议含 token_usage |
 | WorkBuddy | 精确 | `~/.workbuddy/projects/**/*.jsonl` | 每轮模型调用带 `usage`（prompt/completion/total_tokens），逐轮累加即真实计费量 |
 | CodeBuddy | 估算 | `~/.codebuddy/projects/**/*.jsonl` | 文本长度估算 |
-| 豆包工作 | 云端校准 | timeline API 百分比 × 固定系数 | 云端应用只给百分比；系数由**消息级对齐**实测（见 [`docs/DOUBAO.md`](docs/DOUBAO.md)） |
+| 豆包工作 | 云端校准 | timeline API 百分比 × 固定系数 | 云端应用只给百分比；系数由**消息级对齐**校准（见 [`docs/DOUBAO.md`](docs/DOUBAO.md)） |
 | 千问工作 | 估算 | `~/.qwenworkcn/projects/**/*.jsonl` | jsonl 无 usage 字段，文本长度估算 |
 | ZCode | 精确 | `~/.zcode/cli/db/db.sqlite` | 本地 SQLite 用量记录 |
 
 > 标"估算"的 Agent 本地没有精确 token 用量，按文本长度或费用折算，仅供参考。
 
-### WorkBuddy 口径说明（踩坑记录）
+### WorkBuddy 口径说明
 
-WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个坑：
+WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个注意点：
 
 1. **同一行内会出现两个 usage 字典**（原始 API 返回 + 规范化版本，字段分别是
    `prompt_tokens/completion_tokens` 与 `input_tokens/output_tokens`），
-   它们描述同一次调用，**只能取一个**，否则总量恰好翻倍（实测 raw/nodedup = 2.00）。
-2. `prompt_tokens` 每轮携带完整历史（实测前 60 轮 57 次单调递增），
+   它们描述同一次调用，**只能取一个**，否则总量恰好翻倍。
+2. `prompt_tokens` 每轮携带完整历史，
    所以**逐轮累加 `total_tokens` 就是真实计费量**，无需换算。
 
 不要用 `session_usage.credit_json` 折算 token：那是**费用**字段（元），
-与 token 的比值随模型费率浮动（实测 0.31x ~ 12.43x），且约 65% 的会话该字段为 NULL。
+与 token 的比值随模型费率大幅浮动，且多数会话该字段为 NULL。
 
 ### 完全脱离 CC Switch（默认行为）
 
@@ -67,35 +67,26 @@ WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个坑：
 
 **为什么能替代**：CC Switch 本身就是「解析本地会话文件」的 —— 它的
 `proxy_request_logs.data_source` 字段值就是 `codex_session` / `session_log`，
-`request_id` 形如 `codex_session:<sid>:<seq>`。实测 CC 的 26397 条 codex 明细行
-**99.94% 精确命中本地 rollout 文件**、431 条 claude 行 **100% 命中本地 `message.id`**。
-所以它不产生数据，只是转发本地数据。
+`request_id` 形如 `codex_session:<sid>:<seq>`。也就是说它不产生数据，只是转发本地数据，
+因此本项目可以 1:1 复刻，且**覆盖更全**（CC 只收录经过它代理的会话，
+而本地 rollout 文件保留了全部会话）。
 
 **原生采集口径**：
 
 - **Codex**：`~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`，
   逐轮累加 `event_msg.payload.info.last_token_usage`（**增量**；
   `total_token_usage` 是累计值，跨文件会重复，不能用）。
-  ⚠️ `ordinal` 是**文件内**序号（多个文件都从 ord=15 重起），**绝不能单独作去重键**；
+  ⚠️ `ordinal` 是**文件内**序号（多个文件都会从头重新计数），**绝不能单独作去重键**；
   判重必须 `(session_id, ordinal, 四 token 值)` 全同。
 - **Claude Code**：`~/.claude/projects/<编码路径>/<uuid>.jsonl`（含 `subagents/agent-*.jsonl`），
   累加 `message.usage`，**必须按 `message.id` 去重**（同一条回复会因流式/重试落盘多行，
-  不去重虚高 2 倍以上）。
-
-**实测对比**（同一台机器）：
-
-| | 原生本地采集 | CC Switch | 结果 |
-| --- | --- | --- | --- |
-| Codex | **358.8 亿** | 266.2 亿 | 原生多 **34.8%**——CC 只覆盖 32 个会话，本地有 237 个（漏采 84%） |
-| Claude Code | 6.40 亿 | 6.40 亿 | **基本一致**（人机验证口径吻合） |
-
-即：**脱离 CC Switch 不但能抓，Codex 还抓得更全。**
+  不去重会虚高 1 倍以上）。
 
 **一个安全兜底**：若开了 `AGENT_USAGE_USE_CCSWITCH=1` 但 `cc-switch.db` 实际不存在
 （已卸载、或路径不对），原生插件会**自动接管**，不会出现「两边都不产出、数据全丢」。
 判据是「开关 **且** 库存在」，两者同时成立才让位。
 
-> **rollup 历史兜底**：若本机残留过 `cc-switch.db`（哪怕后来卸载），其
+> **rollup 历史兜底**：若曾安装过 `cc-switch.db`（哪怕后来卸载），其
 > `usage_daily_rollups` 长期汇总表仍可用来补本地文件已清掉的历史差额
 > （独立 `source_file` 前缀 `#rollup` 隔离，绝不与本地行相加）。
 > 要完全零 CC 接触就设 `AGENT_USAGE_NO_CC_BACKFILL=1`。
@@ -112,27 +103,26 @@ WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个坑：
 | 空转 + **CC 在岗** | `[]` | 本插件排在 `ccswitch` **之后**执行，返回共用清单会误删它刚插入的行 |
 
 > 为什么空转也要清理：`core.scan` 对每个上报的 `daily_files` 都执行「先删后插」，
-> 而删除范围按 agent 限定。若本机从「CC 模式」切回「默认原生」，CC 明细行
+> 而删除范围按 agent 限定。若从「CC 模式」切回「默认原生」，CC 明细行
 > （`source_file` 指向 `cc-switch.db`）只有原生插件会去清；若原生插件因目录不存在
-> 而早退且不上报清单，这些残留行会**永久躺着**、与本地行叠加虚高
-> （实测曾导致 555 亿的虚高，本地真实量 359 亿）。
+> 而早退且不上报清单，这些残留行会**永久躺着**、与本地行叠加虚高。
 
 **回归测试**：`python tools/test_native_parity.py`
 覆盖 6 个场景：① 默认脱离（**CC 库存在也不读**）② 显式启用 CC ③ 开关空转自动回退
 ④ 零 CC 接触 ⑤ 双向切换无残留 ⑥ CC 残留行兜底清理（本地目录不存在也要清）。
 
-### CC Switch 口径说明（踩坑记录）
+### CC Switch 口径说明
 
 CC Switch 的源库 `~/.cc-switch/cc-switch.db` 是**双表互补**设计，两张表**都必须读**：
 
 | 表 | 覆盖范围 | 粒度 |
 | --- | --- | --- |
-| `proxy_request_logs` | **近 30 天**（滚动窗口，约 8/30 起） | 每次请求一行，含 `session_id` |
-| `usage_daily_rollups` | **30 天前**（长期保留，可回溯至 5 月） | 每日 × 模型汇总，**无 session_id** |
+| `proxy_request_logs` | **近 30 天**（滚动窗口） | 每次请求一行，含 `session_id` |
+| `usage_daily_rollups` | **30 天前**（长期保留） | 每日 × 模型汇总，**无 session_id** |
 
-只读明细表会**丢掉全部 30 天前的历史**（实测本机 codex 少算约 195 亿 token、
-模型数从 10 掉到 4，日曲线起点从 5/18 缩到 8/30）。两表时间范围互补、互不重叠，
-拼接时仍需按 `(agent, day)` 去重，防止将来窗口调整出现重叠日导致重复计数。
+只读明细表会**丢掉全部 30 天前的历史**（模型种类与日曲线起点都会大幅缩水）。
+两表时间范围互补、互不重叠，拼接时仍需按 `(agent, day)` 去重，
+防止将来窗口调整出现重叠日导致重复计数。
 
 另外：proxy 的 `session_id` 粒度 ≠ Codex 真正的会话粒度——同一个会话可能先后用多个模型
 （如 `gpt-5.6-sol` 切到 `gpt-6-sol`）共享同一 `session_id`。**聚合粒度必须到
@@ -152,7 +142,6 @@ CC Switch 的源库 `~/.cc-switch/cc-switch.db` 是**双表互补**设计，两�
 |---|---|
 | 数据源 | **只有 timeline API 一条**（cookie 认证，拉全部记录累加） |
 | 换算系数 | **1% = 50 万 token**（`TOKENS_PER_PCT = 500_000`） |
-| 当前实测 | 全时段 499.20% ⇒ **2.50 亿 token** |
 | 精度 | `estimate=1`（靠百分比反算，非本地计数） |
 | 取不到数据时 | **直接报错**，不静默降级 |
 
@@ -160,8 +149,7 @@ CC Switch 的源库 `~/.cc-switch/cc-switch.db` 是**双表互补**设计，两�
 不要用它推算单个任务或某一天的用量（会低估长 agent 任务 3 倍以上），
 也**不要与其他 Agent 横向比**（豆包记折后计价量，WorkBuddy 等记原始传输量，量纲不同）。
 
-**这个 50 万 是怎么定出来的 → [`docs/DOUBAO.md`](docs/DOUBAO.md)**
-**豆包校准与排障手册（操作向，含已作废错值清单）→ [`docs/SKILL-doubao-calibration.md`](docs/SKILL-doubao-calibration.md)**
+**这个 50 万是怎么定出来的 → [`docs/DOUBAO.md`](docs/DOUBAO.md)**
 
 需要配置 cookie 拿精确百分比时：`~/.doubao-usage/config.json`
 ```json
@@ -243,7 +231,6 @@ curl -X POST http://127.0.0.1:8765/api/agents \
 app.py          入口
 serve.py        HTTP + SSE 服务 + Agent API
 monitor.py      命令行扫描
-adapters.py     旧版适配器
 engine/
   core.py       扫描调度、聚合
   registry.py   插件发现/加载
@@ -253,23 +240,6 @@ engine/
 plugins/        各 Agent 适配器
 web/            ECharts 看板
 ```
-
-## 调试铁律
-
-**改完插件代码，必须先重启 `serve.py`，再判断数据对不对。**
-
-`serve.py` 是常驻进程，且内置 `Watcher`（默认每 5 秒检测数据源变化 → 自动扫描入库）。
-Python 进程**不会热加载**已 import 的模块，所以：
-
-- 你改了 `plugins/*.py` 后，老进程仍在跑**旧代码**，并持续往 `usage.db` 写旧口径的数据；
-- 此时你用命令行单独跑一次扫描，会看到「明明新代码删掉了 A，A 却还在，数值甚至还在涨」
-  —— 因为老进程在你删完后**又写回去了**。这不是代码 bug，是**并发写入的假象**。
-- 判断方法：看 `source_file` 的行是否在扫描间隔（默认 5s）内自行变化。
-  会变 ⇒ 有另一个进程在写 ⇒ 先重启服务再排查。
-
-本次就踩了这个坑：默认脱离 CC 后总量虚高到 555 亿，一度怀疑清理键不匹配，
-实际是 19:xx 启动的老 `serve.py` 一直在用旧代码回写 CC 明细行。
-**杀掉重启后，残留行一次性清干净，总量回落到 509.6 亿（本地真实量）+ 历史 rollup 差额。**
 
 ## 兜底方案
 

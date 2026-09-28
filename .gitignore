@@ -11,6 +11,9 @@ dist/
 # Runtime data（整个 data/ 都是本地运行态，含数据库与插件缓存，永不入库）
 data/
 
+# 本地运行日志
+*.log
+
 # IDE
 .vscode/
 .idea/

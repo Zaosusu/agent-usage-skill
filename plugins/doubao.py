@@ -20,10 +20,10 @@
 
 【为什么不做降级】本地任何途径都拿不到与 timeline 同一额度池的数字：
 - Local Storage 的 usedThisPeriod/monthlyLimit 是**另一个额度池**
-  （plan:premium / billingMode:metered，周期约 4 个月），实测 2.83% vs
-  timeline 499.20%，差 176 倍。乘系数得 141.5 万，而正确量级 2.50 亿。
-  它曾作为降级分支存在，导致 cookie 失效时用量**静默暴跌 176 倍**；
-  2026-09-22 连同分支一起移除，并把降级改为报错。
+  （plan:premium / billingMode:metered，周期约 4 个月），与 timeline 的账户累计量
+  量级差**两个数量级**（同一时刻 2.8% vs 499%，相差约 176 倍）。
+  若用它做降级，cookie 失效时会**静默暴跌约 176 倍**；故该分支已移除，
+  改为直接报错。
 - trajectory.jsonl 只有 5 个顶层字段（role/content/tool_call_id/tool_calls/
   image_link_list），**没有任何 usage 字段**；按文本估算与真实用量无稳定关系
   （同一个 1% 随任务长度浮动 7.7 倍）。
@@ -32,18 +32,20 @@
 
 【两条边界，读数前必读】
 - **只对账户总量成立**：1% 不是固定 token 数，按任务长度浮动 7.7 倍
-  （短对话 21.1 万 / 中等 46.7 万 / 长 agent 161.9 万）。拿 50 万 推算单个任务
+  （短对话约 21 万 / 中等约 47 万 / 长 agent 约 162 万）。拿 50 万 推算单个任务
   或某一天，会低估长任务 3~8 倍。
-  ⚠️ 但**按天的百分比拆分本身是精确的**（实测 Σ每日 pct = 总 pct，误差 0.0），
+  ⚠️ 但**按天的百分比拆分本身是精确的**（Σ每日 pct = 总 pct），
   所以 `agent_usage_history` 里的 pct 时序可信；失真的只是 pct→token 的换算系数。
 - **不能与其他 Agent 横向比**：豆包记的是折后计价量，WorkBuddy 等记原始传输量。
 
 【系数怎么来的（三行版）】
 - 消息级对齐：timeline 每条 = 一条 user 消息，本地重建按同一批消息累加。
-  双向匹配 正向 83.3% / 反向 94.9% ⇒ 对齐成立。
-- 定义式：Σtok(全量) 246,085,702 ÷ Σpct(全量) 499.200% = 49.3 万/1% ⇒ 取整 **50 万**。
-- 独立交叉验证：256K 窗口下 max 单次上下文 242,683 + system 2,671 只剩 16,790 余量
-  ⇒ 系数上界 58.9 万（能否定 120 万/230 万，定不了真值）。50 万 落在区间内。
+  双向匹配：正向约 83% / 反向约 95% ⇒ 对齐成立。
+- 定义式：Σtok(全量) ÷ Σpct(全量) = 约 49.3 万/1% ⇒ 取整 **50 万**。
+- 独立交叉验证：256K 窗口下最紧的那次单调用上下文已逼近窗口，
+  只剩少量余量 ⇒ 系数上界约 58.9 万（足以否定 120 万/230 万，但定不了真值）。
+  50 万 落在区间内。
+- 推导全文与逐项数据见 docs/DOUBAO.md。
 
 【钉死精确值】拿到「一个 7 天窗口 = 多少 token」的绝对数即可一击锁死：
     python tools/calibrate_doubao.py --anchor 1.5e8 --apply
@@ -97,7 +99,7 @@ def _timeline_headers(cookie_str):
 
 
 # 最近一次拉取失败的原因，供 scan() 生成**准确**的报错文案。
-#   ('net',  ...) —— 网络/TLS 层失败，与 cookie 无关（实测有 UNEXPECTED_EOF_WHILE_READING 抖动）
+#   ('net',  ...) —— 网络/TLS 层失败，与 cookie 无关（如 UNEXPECTED_EOF_WHILE_READING 抖动）
 #   ('auth', ...) —— 接口可达但认证失败/无数据，多半 cookie 过期
 _last_error = None
 
@@ -105,7 +107,7 @@ _last_error = None
 def _request_page(cookie_str, cursor, timeout=20, retries=3):
     """拉 timeline 单页，带指数退避重试。
 
-    为什么必须重试：整轮要翻 80+ 页、耗时 2 分钟，而 SSL 层实测存在偶发抖动
+    为什么必须重试：整轮要翻 80+ 页、耗时约 2 分钟，而 SSL 层存在偶发抖动
     （`UNEXPECTED_EOF_WHILE_READING`）。单页抖动就让整轮白费太亏，故重试。
     4xx 是确定性错误（认证/参数），重试无意义，直接上抛。
     """
@@ -134,15 +136,12 @@ def _fetch_timeline(cookie_str):
     【两个必须同时做的防护：页间延迟 + item_id 去重】
     根因是**分页限流**：连续快速翻页时，API 会开始重复返回已经给过的
     条目（游标每次都变、v3./v4. 交替，但内容按 ~4 页周期循环），而
-    has_more **始终为 True**（实测 200/200 永不终止）。
+    has_more **始终为 True**（200/200 页永不终止）。
 
-    实测对照（2026-09-23，同一天同一 cookie）：
-      | 方式             | 页数 | 唯一条目 | 累加 pct | 换算   |
-      |------------------|------|----------|----------|--------|
-      | 无延迟（旧实现） | 200  | 180      | 851.54%  | 4.26亿 |
-      | 有延迟（0.25s）  | 80   | 1591     | 499.20%  | 2.50亿 |
-    旧实现把同一批条目重复计入 ⇒ 总量虚高约 1.7 倍（甚至更高，取决于限流强度），
-    且**每日拆分同样被污染**（同一天被重复累加）。
+    无限流的两个后果（同一 cookie 对照）：
+      - 唯一条目数远小于累计页数（大量页在重复同一批条目）；
+      - 累加 pct 被同一批条目重复计入 ⇒ 总量虚高约 1.7 倍（甚至更高，
+        取决于限流强度），且**每日拆分同样被污染**。
 
     证据：同一 item_id 每次出现 pct 恒定（440/440 全部一致）⇒ 去重合法无损。
 
@@ -157,7 +156,7 @@ def _fetch_timeline(cookie_str):
     daily = {}
     cursor = None
     stale = 0             # 连续无新条目的页数
-    _STALE_LIMIT = 40     # 实测到顶后 40 页内不会有新条目，留足余量
+    _STALE_LIMIT = 40     # 到顶后 40 页内不会有新条目，留足余量
     _PAGE_DELAY = 0.25    # 关键：不加延迟会触发限流，分页开始重复返回
     try:
         for _ in range(200):
@@ -227,8 +226,8 @@ def _extract_cookie():
 def _cookie_hint():
     """报错文案：按**真实失败原因**给出下一步，别一律怪 cookie。
 
-    实测教训：SSL 层有偶发抖动（`UNEXPECTED_EOF_WHILE_READING`），
-    早期文案一律写「cookie 多半已过期」，会让人白去重新登录复制 cookie。
+    SSL 层存在偶发抖动（`UNEXPECTED_EOF_WHILE_READING`），若文案一律写
+    「cookie 多半已过期」，会让人白去重新登录复制 cookie。
     """
     if not os.path.isfile(_CONFIG_PATH):
         return (f"未配置 cookie：请把浏览器里 doubao.com 的 Cookie 写入 {_CONFIG_PATH}\n"

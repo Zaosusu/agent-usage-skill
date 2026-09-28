@@ -6,11 +6,11 @@
 一个 thread（session_meta.session_id）可能落到多个文件：Codex 每次 resume / fork
 都会新开一个文件，但 session_meta.session_id 保持不变。
 
-⚠️ **ordinal 是「文件内」序号，不是 thread 全局序号**（实测：多个文件都从 ord=15
+⚠️ **ordinal 是「文件内」序号，不是 thread 全局序号**（多个文件都从 ord=15
    重新开始）。所以**绝不能按 (session_id, ordinal) 去重**，否则会把不同分支里
    真实发生的消耗误删。
 
-口径（实测单会话与 CC Switch 误差 0.02%）：
+口径：
   - 只认 type=event_msg 且 payload.type=='token_count' 的行
   - 逐轮取 info.last_token_usage（增量）累加；
     info.total_token_usage 是**累计值**，跨文件会重复，不能直接用
@@ -173,7 +173,7 @@ def scan(full, need, mark):
 
     root = expand(WATCH_PATHS[0])
     if not os.path.isdir(root):
-        # 本地目录不存在也必须上报清理清单：历史上 CC 模式可能留下过本 agent 的
+        # 本地目录不存在也必须上报清理清单：CC 模式可能留下过本 agent 的
         # 行（source_file 指向 cc-switch.db），否则切换来源后这些残留行无人清理、总量虚高。
         return {'sessions': [], 'daily': [], 'daily_files': idle_daily_files(KEY)}
 
@@ -264,7 +264,7 @@ def scan(full, need, mark):
                    'source_file': src, 'agent': KEY} for d, c in by_day.items()]
 
     # ---- 可选的历史兜底 ----
-    # 若本机残留 cc-switch.db，用它的 usage_daily_rollups（长期保留）补本地文件
+    # 若本地存在 cc-switch.db，用它的 usage_daily_rollups（长期保留）补本地文件
     # 已清掉 / 被裁剪的日期差额。用独立 source_file（'#rollup'）隔离，绝不与本地行相加。
     # 必须同时补 sessions：看板「总量」取自 sessions 表，只补 daily 会对不上。
     daily_files = codex_daily_files()

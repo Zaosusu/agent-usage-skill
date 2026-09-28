@@ -173,7 +173,7 @@ def scan(full=False, only=None):
         # ① 插件可能改了 session_id 粒度（如 ccswitch 按 model 拆分成 sid@model），
         #    旧粒度 session_id 的残留行不删会与新行并存 ⇒ 总量重复计算；
         # ② 若「先插后删」，这批 delete 会把刚插入的新行一并删掉
-        #    （曾导致 codex/claude 数据被整批清空，upserted 计数却非 0）。
+        #    （数据被整批清空，upserted 计数却非 0）。
         # 删除范围必须同时限定 agent：一个插件可能报多个 agent（如 ccswitch 同时报 codex+claude），
         # 若只按 source_file 删，会误删同源下其他 agent 的行。
         agents_in_rows = {key} | {d.get('agent', key) for d in daily_rows}

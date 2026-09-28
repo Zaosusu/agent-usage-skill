@@ -148,7 +148,7 @@ def scan_jsonl_dir(root, pattern, parse_fn, full, need, mark):
 
 
 # ---------- 数据源开关：默认完全脱离 CC Switch ----------
-# 设计原则（2026-09-28 定）：
+# 设计原则：
 #   **本项目默认不依赖 CC Switch。** codex / claude 由原生插件直接解析本地会话文件
 #   （~/.codex/sessions/**、~/.claude/projects/**），无需任何第三方代理。
 #   CC Switch 只是**可选**的替代来源，必须显式开启才会使用。
@@ -219,15 +219,15 @@ def claude_daily_files():
 #
 #   在岗（本轮真的产出了数据）→ 返回 codex_daily_files()/claude_daily_files()
 #       「共用清单」：既清自己的本地行，也清对方（CC）名下的历史行，
-#       因为历史上前者可能记过同一份数据（跨来源切换必须双向清理，否则叠加）。
+#       因为跨来源记录过同一份数据时必须双向清理，否则叠加。
 #
 #   空转（本轮不产出，如未开开关、或本地目录不存在）→ 用 idle_daily_files()
 #       ① CC 在岗时 → 返回 []：本插件排在 ccswitch **之后**执行，
 #          若此时返回共用清单，会把 ccswitch 刚插入的行顺手删光（先删后插所致）。
 #       ② CC 不在岗时 → 返回该 agent 的共用清单：清掉「CC 部落」的历史残留。
-#          这是必要的兜底 —— 例如本机从没用过 codex 原生 CLI（目录不存在），
-#          但历史 CC 模式留下过 codex 的 CC 明细行；若不清理，切换后
-#          codex 的 CC 残留行会一直虚高，且没有任何插件会去删它。
+#          这是必要的兜底 —— 例如从未用过 codex 原生 CLI（目录不存在），
+#          但 CC 模式留下过 codex 的 CC 明细行；若不清理，切换后
+#          codex 的 CC 残留行会一直虚高（没有任何插件会去删它）。
 def idle_daily_files(agent):
     """空转插件该上报的清理清单（见上方双档语义）。"""
     if cc_source_active():
@@ -279,16 +279,15 @@ def cc_rollup_fallback(agent, local_by_day):
     ⚠️ 必须**同时**产出 sessions，不能只补 daily：
     看板「总 token / agent 总量 / 模型分布」都取自 sessions 表，
     若只补 daily 曲线，会出现「曲线面积 > 卡片总量」的自相矛盾
-    （实测曾导致 claude 无 CC 时总量偏少 33%）。
+    （只补 daily 会漏掉 sessions 侧的量，使总量偏少）。
 
     local_by_day：{day: tokens} 本地文件已采到的每日量。分三种情况：
       1. 本地完全没有该日（lt == 0）→ 整日用 rollup 补
       2. 本地有该日、但 rollup 显著更大（>0.5%）→ 判定本地文件被**裁剪**，
          只补差额（按当日各 model 占比分摊），避免与本地重复计数
-         （实测：claude 本地文件被历史清理后，8/10 只剩 33%、8/12 只剩 62%）
       3. 其余情况（含两边相等的多数日）→ 本地为准，跳过
 
-    依据：实测 5 个重叠日两边用量**个位数完全相等**（同源同算法），
+    依据：多个重叠日两边用量几乎完全相等（同源同算法），
     因此「不相等」只可能来自本地文件不完整，而非口径差异。
     """
     import collections

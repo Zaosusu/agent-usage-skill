@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """插件：CC Switch（权威用量源）。
 
-CC Switch 是本机的 API 代理，所有 Codex / Claude Code 的请求都经过它，
+CC Switch 是 Codex / Claude Code 的 API 代理，所有请求都经过它，
 token 数是精确计数（含缓存命中），比逆向本地 rollout 文件准确得多。
 
 数据源：~/.cc-switch/cc-switch.db，**两张互补的表**，必须都读：
@@ -11,8 +11,7 @@ token 数是精确计数（含缓存命中），比逆向本地 rollout 文件�
   - usage_daily_rollups = 30 天前滚出明细窗口的**每日×模型汇总**（长期保留），
       date, app_type, model, request_count, input/output/cache_* tokens, total_cost_usd
 
-⚠️ 只读 proxy_request_logs 会丢掉全部 30 天前的历史
-   （实测曾丢掉 codex 5/18~8/29 约 194 亿 token、乃至 gpt-5.5 等模型的整段记录）。
+⚠️ 只读 proxy_request_logs 会丢掉全部 30 天前的历史（含该时段内所有模型）。
    两表时间范围互补、互不重叠：明细 ≥ 切分日，rollup < 切分日。
 """
 import os
@@ -87,9 +86,9 @@ def _build_sid_cwd_map():
 
 def _db_path():
     # 必须 normpath：Windows 下 ~/.cc-switch/cc-switch.db 展开会变成
-    # 'C:\\Users\\xxx/.cc-switch/cc-switch.db'（反斜杠+正斜杠混用），
-    # 会导致按 source_file 清理时匹配不到旧行（或匹配不一致），
-    # 且 source_file 字段入库后跨机器/跨时间格式不一致。
+    # 'C:\Users\xxx/.cc-switch/cc-switch.db'（反斜杠+正斜杠混用），
+    # 会导致按 source_file 清理时匹配不到旧行，
+    # 且 source_file 字段入库后格式不一致（跨机器/跨时间无法稳定比对）。
     return os.path.normpath(os.path.expanduser(
         WATCH_PATHS[0].replace('%USERPROFILE%', os.path.expanduser('~'))))
 
@@ -256,7 +255,7 @@ def scan(full, need, mark):
         # 明细与汇总分属不同 source_file：引擎按 source_file 先删后插，各自独立清理。
         # ⚠️ 这里返回的是**与原生 codex/claude 插件共用**的清理清单
         #    （common.codex_daily_files / claude_daily_files 的同名内容）：
-        #    若本机从「无 CC（走原生插件）」切到「装 CC（走本插件）」，
+        #    从「无 CC（走原生插件）」切到「装 CC（走本插件）」时，
         #    原生插件留下的 daily 行必须由本插件一并清掉，否则两条曲线叠加、重复计数。
         'daily_files': [dbp, dbp + '#rollup', _CODEX_ROOT_NP, _CLAUDE_ROOT_NP],
     }

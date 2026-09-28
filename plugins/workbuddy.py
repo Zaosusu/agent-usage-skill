@@ -6,15 +6,15 @@
    "prompt_cache_hit_tokens": ..., "prompt_cache_miss_tokens": ...}
 以及规范化版本 {"input_tokens": N, "output_tokens": M, "total_tokens": N+M, ...}
 
-重要口径说明（已实测验证）：
+口径说明：
 1. **同一行内会出现两个 usage 字典**（原始 API 返回 + 规范化版本），
    它们描述同一次调用，**只能取一个**，否则总量翻倍。
-2. `prompt_tokens` 每轮携带完整历史（实测前 60 轮 57 次单调递增），
+2. `prompt_tokens` 每轮携带完整历史（前 60 轮中 57 次单调递增），
    所以**逐轮累加 total_tokens 就是真实计费量**，不需要额外换算。
 3. 因此本插件产出的是**真实 token（est=0）**，不是估算。
 
 不再使用 `session_usage.credit_json`：那是**费用**字段（元），
-与 token 的比值随模型费率浮动（实测 0.31x~12.43x），无法作为 token 计量。
+与 token 的比值随模型费率浮动（0.31x~12.43x），无法作为 token 计量。
 """
 from __future__ import annotations
 import json, os, glob, time
