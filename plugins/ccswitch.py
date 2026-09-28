@@ -2,13 +2,18 @@
 """插件：CC Switch（权威用量源）。
 
 CC Switch 是本机的 API 代理，所有 Codex / Claude Code 的请求都经过它，
-proxy_request_logs 表记录了每一次请求的精确 token 数（含缓存命中），
-这比逆向本地 rollout 文件准确得多。
+token 数是精确计数（含缓存命中），比逆向本地 rollout 文件准确得多。
 
-数据源：~/.cc-switch/cc-switch.db
-  - proxy_request_logs: created_at(秒), app_type(codex/claude), model,
-    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-    total_cost_usd, session_id
+数据源：~/.cc-switch/cc-switch.db，**两张互补的表**，必须都读：
+  - proxy_request_logs  = 近 30 天**明细**（每次请求一行），
+      created_at(秒), app_type(codex/claude), model, input/output/cache_*,
+      total_cost_usd, session_id
+  - usage_daily_rollups = 30 天前滚出明细窗口的**每日×模型汇总**（长期保留），
+      date, app_type, model, request_count, input/output/cache_* tokens, total_cost_usd
+
+⚠️ 只读 proxy_request_logs 会丢掉全部 30 天前的历史
+   （实测曾丢掉 codex 5/18~8/29 约 194 亿 token、乃至 gpt-5.5 等模型的整段记录）。
+   两表时间范围互补、互不重叠：明细 ≥ 切分日，rollup < 切分日。
 """
 import os
 import re
@@ -99,28 +104,41 @@ def scan(full, need, mark):
     con = ro_connect(dbp)
     if con is None:
         return {'sessions': [], 'daily': [], 'daily_files': []}
+    detail_rows = []
+    rollup_rows = []
     try:
-        rows = con.execute(
+        detail_rows = con.execute(
             'select created_at, app_type, model, input_tokens, output_tokens, '
             'cache_read_tokens, cache_creation_tokens, total_cost_usd, session_id '
             'from proxy_request_logs'
         ).fetchall()
     except Exception:
-        con.close()
-        return {'sessions': [], 'daily': [], 'daily_files': []}
+        detail_rows = []
+    try:
+        # 30 天前滚出明细窗口的历史汇总（长期保留）
+        rollup_rows = con.execute(
+            'select date, app_type, model, request_count, input_tokens, output_tokens, '
+            'cache_read_tokens, cache_creation_tokens, total_cost_usd '
+            'from usage_daily_rollups'
+        ).fetchall()
+    except Exception:
+        rollup_rows = []
     con.close()
 
     # 按 (agent, day) 聚合
     by_day = collections.defaultdict(lambda: collections.Counter())
     # 按 session 聚合
     sess = {}
-    for r in rows:
+    # 明细已覆盖的 (agent, day)，用于 rollup 去重
+    detail_days = set()
+    for r in detail_rows:
         (ts, app, model, inp, out, cr, cc, cost, sid) = r
         agent = APP_TO_AGENT.get(app)
         if not agent or not ts:
             continue
         tok = (inp or 0) + (out or 0) + (cr or 0) + (cc or 0)
         day = time.strftime('%Y-%m-%d', time.localtime(ts))
+        detail_days.add((agent, day))
         by_day[(agent, day)]['tokens'] += tok
         by_day[(agent, day)]['cost'] += float(cost or 0)
 
@@ -150,16 +168,62 @@ def scan(full, need, mark):
         s['cost'] += float(cost or 0)
         s['last_activity_at'] = max(s['last_activity_at'], ts * 1000)
 
+    # 历史汇总表：只有「每日 × 模型」粒度，无 session_id / provider 明细，
+    # 无法还原到具体会话，统一按 (agent, day, model) 聚合为一条伪会话。
+    # 用独立的 source_file 前缀 '#rollup'，与明细的清理互不干扰。
+    rollup_agg = {}
+    for r in rollup_rows:
+        (d, app, model, reqs, inp, out, cr, cc, cost) = r
+        agent = APP_TO_AGENT.get(app)
+        if not agent or not d:
+            continue
+        # 去重保护：明细已覆盖的日期不再累加（防止两表未来出现重叠日重复计数）
+        if (agent, d) in detail_days:
+            continue
+        tok = (inp or 0) + (out or 0) + (cr or 0) + (cc or 0)
+        if tok <= 0:
+            continue
+        k = (agent, d, model or '')
+        if k not in rollup_agg:
+            ts_ms = int(time.mktime(time.strptime(d, '%Y-%m-%d'))) * 1000
+            rollup_agg[k] = {
+                'agent': agent,
+                'session_id': 'rollup:%s@%s' % (d, model or ''),
+                'title': (model or '').strip() or '历史汇总',
+                'cwd': '', 'model': model or '', 'provider': 'ccswitch',
+                'created_at': ts_ms, 'last_activity_at': ts_ms,
+                'input_tokens': 0, 'output_tokens': 0,
+                'cache_read_tokens': 0, 'cache_write_tokens': 0,
+                'total_tokens': 0, 'cost': 0.0, 'est': 0,
+                'source_file': dbp + '#rollup', '_raw_sid': '',
+            }
+        s = rollup_agg[k]
+        s['input_tokens'] += inp or 0
+        s['output_tokens'] += out or 0
+        s['cache_read_tokens'] += cr or 0
+        s['cache_write_tokens'] += cc or 0
+        s['total_tokens'] += tok
+        s['cost'] += float(cost or 0)
+
     daily_rows = []
     for (agent, day), c in by_day.items():
         daily_rows.append({
             'day': day, 'tokens': c['tokens'], 'est': 0,
             'source_file': dbp, 'agent': agent,
         })
+    # rollup 的按天行单独聚合（同样跳过与明细重叠的日期）
+    rollup_by_day = collections.defaultdict(lambda: collections.Counter())
+    for (agent, d, model), s in rollup_agg.items():
+        rollup_by_day[(agent, d)]['tokens'] += s['total_tokens']
+    for (agent, day), c in rollup_by_day.items():
+        daily_rows.append({
+            'day': day, 'tokens': c['tokens'], 'est': 0,
+            'source_file': dbp + '#rollup', 'agent': agent,
+        })
 
     sessions = []
     cwd_map = _build_sid_cwd_map()
-    for s in sess.values():
+    for s in list(sess.values()) + list(rollup_agg.values()):
         s['cost'] = round(s['cost'], 4)
         # 从 rollout 文件补 cwd
         if not s['cwd'] and s.get('_raw_sid') in cwd_map:
@@ -171,5 +235,6 @@ def scan(full, need, mark):
     return {
         'sessions': sessions,
         'daily': daily_rows,
-        'daily_files': [dbp],
+        # 明细与汇总分属不同 source_file：引擎按 source_file 先删后插，各自独立清理
+        'daily_files': [dbp, dbp + '#rollup'],
     }
