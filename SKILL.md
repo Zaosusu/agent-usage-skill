@@ -88,8 +88,8 @@ curl -s -o /dev/null -w "HTTP %{http_code}" --max-time 8 "http://127.0.0.1:8765/
 
 | Agent | key | 精确度 |
 |---|---|---|
-| Codex | `codex` | 精确（CC Switch 代理日志，含缓存命中） |
-| Claude Code | `claude` | 精确（CC Switch 代理日志，含缓存命中） |
+| Codex | `codex` | 精确（CC Switch 代理日志 / 无 CC 时本地 rollout 文件，**自动切换**） |
+| Claude Code | `claude` | 精确（CC Switch 代理日志 / 无 CC 时本地 projects jsonl，**自动切换**） |
 | Kimi | `kimi` | 精确（本地 wire 协议） |
 | WorkBuddy | `workbuddy` | 精确（jsonl 真实 `usage`，去重后 est=0） |
 | CodeBuddy | `codebuddy` | 精确（jsonl `message.usage`） |
@@ -97,10 +97,17 @@ curl -s -o /dev/null -w "HTTP %{http_code}" --max-time 8 "http://127.0.0.1:8765/
 | 豆包工作 | `doubao` | **估算**（云端只给百分比 × 50 万系数） |
 | 千问工作 | `qwenworkcn` | 估算（文本长度） |
 
-> **`codex` / `claude` 的来源**：两者的请求都经过本机 CC Switch 代理，
-> 由 `plugins/ccswitch.py` 从 `~/.cc-switch/cc-switch.db` 的 `proxy_request_logs`
-> 表读取后按 `app_type` 映射上报（`APP_TO_AGENT = {'codex':'codex','claude':'claude'}`）。
-> 注意插件文件名是 `ccswitch.py`、文件内 `KEY='ccswitch'`，但**上报 key 是 `codex`/`claude`**。
+> **`codex` / `claude` 的来源（双通道，自动切换）**：
+> - 本机**装了** CC Switch（存在 `~/.cc-switch/cc-switch.db`）→ 由 `plugins/ccswitch.py`
+>   读代理库，按 `app_type` 映射上报。注意插件文件名是 `ccswitch.py`、其 `KEY='ccswitch'`，
+>   但**上报 key 是 `codex`/`claude`**。
+> - 本机**没装**（朋友机器 / 已卸载）→ 由 `plugins/codex.py` + `plugins/claude.py`
+>   **直接解析本地会话文件**。原生插件在 CC 在岗时默认静默，避免重复计数；
+>   `AGENT_USAGE_FORCE_NATIVE=1` 可强制启用。
+>
+> 无需任何配置，判据就是「文件存不存在」。实测无 CC 时 Codex 反而更全
+> （本地 358.8 亿 vs CC 266.2 亿，CC 漏采 84% 会话），claude 与 CC 比值 1.000。
+> 回归测试：`python tools/test_native_parity.py`（并存 / 无 CC / 切换卸载 三场景）。
 
 标"估算"的 Agent 本地没有精确 token 用量，按文本长度或费用折算，仅供参考。
 **豆包**是唯一需要系数校准的（云端只给百分比）；换算直接用 **1% = 50 万**，
