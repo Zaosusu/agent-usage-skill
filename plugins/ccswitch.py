@@ -77,7 +77,12 @@ def _build_sid_cwd_map():
 
 
 def _db_path():
-    return os.path.expanduser(WATCH_PATHS[0].replace('%USERPROFILE%', os.path.expanduser('~')))
+    # 必须 normpath：Windows 下 ~/.cc-switch/cc-switch.db 展开会变成
+    # 'C:\\Users\\xxx/.cc-switch/cc-switch.db'（反斜杠+正斜杠混用），
+    # 会导致按 source_file 清理时匹配不到旧行（或匹配不一致），
+    # 且 source_file 字段入库后跨机器/跨时间格式不一致。
+    return os.path.normpath(os.path.expanduser(
+        WATCH_PATHS[0].replace('%USERPROFILE%', os.path.expanduser('~'))))
 
 
 def scan(full, need, mark):
@@ -119,17 +124,22 @@ def scan(full, need, mark):
         by_day[(agent, day)]['tokens'] += tok
         by_day[(agent, day)]['cost'] += float(cost or 0)
 
-        key = (agent, sid or '')
+        # 聚合粒度必须到 (agent, sid, model)：
+        # proxy 的 session_id 粒度 ≠ codex 真正会话粒度——同一个 codex 会话在 proxy 层
+        # 可能先后用多个模型（如 gpt-5.6-sol 切到 gpt-6-sol），共享同一个 session_id。
+        # 若只按 (agent, sid) 聚合，后处理的 model 会覆盖前者，导致早期模型类型
+        # （如 gpt-6-sol）作为独立维度彻底丢失、token 被错算进最后一个 model。
+        key = (agent, sid or '', model or '')
         if key not in sess:
             sess[key] = {
-                'agent': agent, 'session_id': sid or '',
+                'agent': agent, 'session_id': '%s@%s' % (sid or '', model or ''),
                 'title': (model or '').strip() or '未命名会话',
                 'cwd': '', 'model': model or '', 'provider': 'ccswitch',
                 'created_at': ts * 1000, 'last_activity_at': ts * 1000,
                 'input_tokens': 0, 'output_tokens': 0,
                 'cache_read_tokens': 0, 'cache_write_tokens': 0,
                 'total_tokens': 0, 'cost': 0.0, 'est': 0,
-                'source_file': dbp,
+                'source_file': dbp, '_raw_sid': sid or '',
             }
         s = sess[key]
         s['input_tokens'] += inp or 0
@@ -152,8 +162,9 @@ def scan(full, need, mark):
     for s in sess.values():
         s['cost'] = round(s['cost'], 4)
         # 从 rollout 文件补 cwd
-        if not s['cwd'] and s['session_id'] in cwd_map:
-            s['cwd'] = cwd_map[s['session_id']]
+        if not s['cwd'] and s.get('_raw_sid') in cwd_map:
+            s['cwd'] = cwd_map[s['_raw_sid']]
+        s.pop('_raw_sid', None)
         if s['total_tokens'] > 0:
             sessions.append(s)
 

@@ -660,7 +660,11 @@ function renderProjects(){
 /* ---------- model top ---------- */
 function renderModels(){
   if (!modelChart || !data) return;
-  const models = (data.models||[]).slice(0,15).reverse();
+  // 与 daily / agent 图保持一致：选中某 Agent 时，模型图也只显示该 Agent 的模型。
+  // 否则多模型 Agent（如 codex 的 gpt-6-sol）会被其他 Agent 的模型挤出视野。
+  let pool = data.models||[];
+  if (filterAgent) pool = pool.filter(m => m.agent === filterAgent);
+  const models = pool.slice(0,15).reverse();
   const series = [{
     type:'bar', barWidth:12,
     data: models.map(m => ({

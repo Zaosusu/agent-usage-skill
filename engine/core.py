@@ -169,6 +169,18 @@ def scan(full=False, only=None):
             daily_rows = []
             daily_files = []
         upserted = 0
+        # 先删该数据源旧行（sessions + daily），再插入 —— 必须「先删后插」：
+        # ① 插件可能改了 session_id 粒度（如 ccswitch 按 model 拆分成 sid@model），
+        #    旧粒度 session_id 的残留行不删会与新行并存 ⇒ 总量重复计算；
+        # ② 若「先插后删」，这批 delete 会把刚插入的新行一并删掉
+        #    （曾导致 codex/claude 数据被整批清空，upserted 计数却非 0）。
+        # 删除范围必须同时限定 agent：一个插件可能报多个 agent（如 ccswitch 同时报 codex+claude），
+        # 若只按 source_file 删，会误删同源下其他 agent 的行。
+        agents_in_rows = {key} | {d.get('agent', key) for d in daily_rows}
+        for df in daily_files:
+            for ag in agents_in_rows:
+                con.execute('delete from sessions where agent=? and source_file=?', (ag, df))
+                con.execute('delete from daily where agent=? and source_file=?', (ag, df))
         for r in rows:
             con.execute('''
                 insert into sessions(agent, session_id, title, cwd, model, provider,
@@ -192,13 +204,6 @@ def scan(full=False, only=None):
                   r['cache_write_tokens'], r['total_tokens'], r['cost'], r['est'],
                   r['source_file'], now))
             upserted += 1
-        # 按天真实聚合（插件返回的 daily）：先删该数据源旧行，再插入
-        # 删除范围必须同时限定 agent：一个插件可能报多个 agent（如 ccswitch 同时报 codex+claude），
-        # 若只按 source_file 删，会误删同源下其他 agent 的行。
-        agents_in_rows = {key} | {d.get('agent', key) for d in daily_rows}
-        for df in daily_files:
-            for ag in agents_in_rows:
-                con.execute('delete from daily where agent=? and source_file=?', (ag, df))
         for d in daily_rows:
             d_agent = d.get('agent', key)
             con.execute(
