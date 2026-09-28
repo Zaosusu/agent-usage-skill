@@ -144,8 +144,8 @@ footer{margin-top:24px;padding-top:14px;border-top:1px solid var(--line);font-si
       <h2>各 Agent 总用量</h2>
       <div class="chart" id="agentChart"></div>
     </div>
-    <div class="card">
-      <h2>模型用量 TOP 15</h2>
+    <div class="card" id="modelCard">
+      <h2 id="modelTitle">模型用量 TOP 10</h2>
       <div class="chart" id="modelChart"></div>
     </div>
     <div class="card span2">
@@ -658,13 +658,42 @@ function renderProjects(){
 }
 
 /* ---------- model top ---------- */
+let showAllModels = false;      // false = TOP 10；true = 全貌
+function toggleModels(){
+  showAllModels = !showAllModels;
+  const btn = $('modelMoreBtn');
+  if (btn) btn.textContent = showAllModels ? '收起' : '查看更多';
+  renderModels();
+}
+
 function renderModels(){
   if (!modelChart || !data) return;
   // 与 daily / agent 图保持一致：选中某 Agent 时，模型图也只显示该 Agent 的模型。
   // 否则多模型 Agent（如 codex 的 gpt-6-sol）会被其他 Agent 的模型挤出视野。
   let pool = data.models||[];
   if (filterAgent) pool = pool.filter(m => m.agent === filterAgent);
-  const models = pool.slice(0,15).reverse();
+
+  const total = pool.length;
+  const CAP = 10;
+  const expanded = showAllModels && total > CAP;   // 只有"确实有更多"时才算展开
+  const models = (expanded ? pool : pool.slice(0, CAP)).slice().reverse();
+
+  // 标题与按钮随状态更新
+  const card = $('modelCard');
+  const title = $('modelTitle');
+  if (title){
+    const head = expanded ? '模型用量 全部' : `模型用量 TOP ${Math.min(CAP, total || CAP)}`;
+    const cnt = `（共 ${total} 项）`;
+    title.innerHTML = head + `<span style="font-weight:400;color:#5A6472;font-size:12px">${cnt}</span>` +
+      (total > CAP ? `<span class="ctrl toolbar"><button class="btn" id="modelMoreBtn" onclick="toggleModels()">${expanded ? '收起' : '查看更多'}</button></span>` : '');
+  }
+  // 展开时铺满整行，避免长列表挤在半宽卡片里
+  if (card) card.classList.toggle('span2', expanded);
+  // ⚠️ 必须操作 DOM 元素设高度：modelChart 是 ECharts 实例，没有 .style
+  const el = $('modelChart');
+  if (el) el.style.height = expanded ? Math.max(300, total * 26 + 40) + 'px' : '';
+  if (modelChart.resize) modelChart.resize();
+
   const series = [{
     type:'bar', barWidth:12,
     data: models.map(m => ({
