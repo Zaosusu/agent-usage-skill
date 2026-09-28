@@ -147,6 +147,155 @@ def scan_jsonl_dir(root, pattern, parse_fn, full, need, mark):
     return out
 
 
+# ---------- CC Switch 长期汇总表（可选的「历史兜底」数据源） ----------
+# 背景：cc-switch 的 proxy_request_logs 只保留近 30 天明细，
+#       30 天前会滚进 usage_daily_rollups（每日×模型汇总，长期保留）。
+# 本地 rollout / projects 文件若被清理，这段历史就只剩 rollup 有。
+# 原生插件（codex.py / claude.py）用本函数做**日级兜底**：
+#   本地文件已覆盖的日期以本地为准，本地没有的日期用 rollup 补。
+CC_SWITCH_DB = os.path.expanduser('~/.cc-switch/cc-switch.db')
+CODEX_ROOT = os.path.expanduser('~/.codex/sessions')
+CLAUDE_ROOT = os.path.expanduser('~/.claude/projects')
+
+
+def _np(p):
+    return os.path.normpath(p)
+
+
+def codex_daily_files():
+    """codex 这个 agent 名下「所有可能出现 daily 行」的 source_file 全集。
+
+    ⚠️ 必须让 ccswitch 插件与原生 codex 插件共用这份清单：
+    否则「先无 CC（原生写行）→ 后装 CC（ccswitch 写行）」时，
+    另一侧的历史行不会被清掉 ⇒ daily 曲线重复计数。
+    先把两边都清掉再插入，无论谁运行，结果都唯一。
+    """
+    return [_np(CODEX_ROOT), _np(CC_SWITCH_DB), _np(CC_SWITCH_DB) + '#rollup']
+
+
+def claude_daily_files():
+    """claude 这个 agent 名下所有可能 source_file 的全集（同上）。"""
+    return [_np(CLAUDE_ROOT), _np(CC_SWITCH_DB), _np(CC_SWITCH_DB) + '#rollup']
+
+
+def cc_rollup_rows(app_type):
+    """读 cc-switch 的 usage_daily_rollups，返回 [(day, model, in, out, cr, cw)]。
+
+    cc-switch 不存在 / 表不存在 / 无法读取时一律返回 []（绝不抛异常）。
+    """
+    import sqlite3
+    if not os.path.exists(CC_SWITCH_DB):
+        return []
+    try:
+        con = sqlite3.connect(
+            'file:' + CC_SWITCH_DB.replace('\\', '/') + '?mode=ro', uri=True)
+    except sqlite3.Error:
+        return []
+    rows = []
+    try:
+        rows = con.execute(
+            'select date, model, input_tokens, output_tokens, '
+            'cache_read_tokens, cache_creation_tokens '
+            'from usage_daily_rollups where app_type=?', (app_type,)).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return [(r[0], r[1] or '', r[2] or 0, r[3] or 0, r[4] or 0, r[5] or 0)
+            for r in rows if r[0]]
+
+
+def cc_rollup_fallback(agent, local_by_day):
+    """CC rollup 兜底：用 cc-switch 长期汇总表补齐本地文件缺失的用量。
+
+    返回 (daily_rows, session_rows)，粒度与 plugins/ccswitch.py **完全对齐**：
+      - daily  ：按 (agent, day)
+      - session：按 (agent, day, model) 合成伪会话，session_id = 'rollup:<day>@<model>'
+
+    ⚠️ 必须**同时**产出 sessions，不能只补 daily：
+    看板「总 token / agent 总量 / 模型分布」都取自 sessions 表，
+    若只补 daily 曲线，会出现「曲线面积 > 卡片总量」的自相矛盾
+    （实测曾导致 claude 无 CC 时总量偏少 33%）。
+
+    local_by_day：{day: tokens} 本地文件已采到的每日量。分三种情况：
+      1. 本地完全没有该日（lt == 0）→ 整日用 rollup 补
+      2. 本地有该日、但 rollup 显著更大（>0.5%）→ 判定本地文件被**裁剪**，
+         只补差额（按当日各 model 占比分摊），避免与本地重复计数
+         （实测：claude 本地文件被历史清理后，8/10 只剩 33%、8/12 只剩 62%）
+      3. 其余情况（含两边相等的多数日）→ 本地为准，跳过
+
+    依据：实测 5 个重叠日两边用量**个位数完全相等**（同源同算法），
+    因此「不相等」只可能来自本地文件不完整，而非口径差异。
+    """
+    import collections
+    import time as _t
+    rollup = cc_rollup_rows(agent)
+    if not rollup:
+        return [], []
+    rsrc = _np(CC_SWITCH_DB) + '#rollup'
+    by_day_model = collections.defaultdict(dict)
+    by_day_tot = collections.Counter()
+    for (day, model, i, o_, cr, cw) in rollup:
+        tok = (i or 0) + (o_ or 0) + (cr or 0) + (cw or 0)
+        if tok <= 0:
+            continue
+        mk = model or ''
+        by_day_model[day][mk] = by_day_model[day].get(mk, 0) + tok
+        by_day_tot[day] += tok
+
+    local_by_day = local_by_day or {}
+    daily_rows = []
+    agg = {}
+    for day, rt in by_day_tot.items():
+        lt = local_by_day.get(day, 0)
+        if lt == 0:
+            gap = rt
+        elif rt > lt * 1.005:
+            gap = rt - lt          # ← 本地被裁剪，只补差额
+        else:
+            continue               # ← 本地完整（含两边相等），不重复计
+        if gap <= 0:
+            continue
+        try:
+            ts_ms = int(_t.mktime(_t.strptime(day, '%Y-%m-%d'))) * 1000
+        except Exception:
+            continue
+        daily_rows.append({'day': day, 'tokens': gap, 'est': 0,
+                           'source_file': rsrc, 'agent': agent})
+        # 差额按当日各 model 占比分摊（末条吸收舍入余量，确保合计 == gap）
+        models = list(by_day_model[day].items())
+        assigned = 0
+        for idx, (mk, mt) in enumerate(models):
+            if idx == len(models) - 1:
+                share = gap - assigned
+            else:
+                share = int(round(gap * mt / rt))
+                assigned += share
+            if share <= 0:
+                continue
+            k = (day, mk)
+            s = agg.get(k)
+            if s is None:
+                s = {
+                    'agent': agent,
+                    'session_id': 'rollup:%s@%s' % (day, mk),
+                    'title': mk.strip() or '历史汇总',
+                    'cwd': '', 'model': mk, 'provider': agent,
+                    'created_at': ts_ms, 'last_activity_at': ts_ms,
+                    'input_tokens': 0, 'output_tokens': 0,
+                    'cache_read_tokens': 0, 'cache_write_tokens': 0,
+                    'total_tokens': 0, 'cost': None, 'est': 0,
+                    'source_file': rsrc,
+                }
+                agg[k] = s
+            s['total_tokens'] += share
+    return daily_rows, list(agg.values())
+
+
+
 def parse_claude_like_file(agent, path, root=None):
     """Claude CLI / CodeBuddy 类 JSONL 会话解析。root 用于生成相对 session_id。"""
     sid = os.path.splitext(os.path.basename(path))[0]

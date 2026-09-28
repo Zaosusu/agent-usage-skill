@@ -36,6 +36,10 @@ APP_TO_AGENT = {
 
 _CODEX_ROLLOUT_ROOT = os.path.expanduser('~/.codex/sessions')
 _CLAUDE_PROJECTS_ROOT = os.path.expanduser('~/.claude/projects')
+# 与 engine.common.codex_daily_files()/claude_daily_files() 返回的本地 root 完全同格式，
+# 供本插件的 daily_files 清理清单共用（见 scan() 末尾注释）。
+_CODEX_ROOT_NP = os.path.normpath(_CODEX_ROLLOUT_ROOT)
+_CLAUDE_ROOT_NP = os.path.normpath(_CLAUDE_PROJECTS_ROOT)
 _sid_cwd_cache = None
 
 
@@ -235,6 +239,10 @@ def scan(full, need, mark):
     return {
         'sessions': sessions,
         'daily': daily_rows,
-        # 明细与汇总分属不同 source_file：引擎按 source_file 先删后插，各自独立清理
-        'daily_files': [dbp, dbp + '#rollup'],
+        # 明细与汇总分属不同 source_file：引擎按 source_file 先删后插，各自独立清理。
+        # ⚠️ 这里返回的是**与原生 codex/claude 插件共用**的清理清单
+        #    （common.codex_daily_files / claude_daily_files 的同名内容）：
+        #    若本机从「无 CC（走原生插件）」切到「装 CC（走本插件）」，
+        #    原生插件留下的 daily 行必须由本插件一并清掉，否则两条曲线叠加、重复计数。
+        'daily_files': [dbp, dbp + '#rollup', _CODEX_ROOT_NP, _CLAUDE_ROOT_NP],
     }

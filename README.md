@@ -30,7 +30,8 @@ agent-usage-skill.exe [--port 8765] [--no-open] [--interval 5] [--full]
 
 | Agent | 精确度 | 数据源 | 说明 |
 | --- | --- | --- | --- |
-| Codex / Claude | 精确 | CC Switch `proxy_request_logs` + `usage_daily_rollups` | 代理层记录每次请求的 input/output/cache tokens。**两表互补必读**：明细表只保留近 30 天，30 天前的历史汇总在续期表，只读前者会丢全部历史 |
+| Codex | 精确 | **CC Switch**（在岗时）/ **本地 rollout 文件**（无 CC Switch 时） | 两套采集器**自动切换、静默共存**，见下方「没有 CC Switch 也能抓」 |
+| Claude Code | 精确 | **CC Switch**（在岗时）/ **`~/.claude/projects/**.jsonl`**（无 CC Switch 时） | 同上 |
 | Kimi Code | 精确 | `~/.kimi/sessions/**/wire.jsonl` | 本地 wire 协议含 token_usage |
 | WorkBuddy | 精确 | `~/.workbuddy/projects/**/*.jsonl` | 每轮模型调用带 `usage`（prompt/completion/total_tokens），逐轮累加即真实计费量 |
 | CodeBuddy | 估算 | `~/.codebuddy/projects/**/*.jsonl` | 文本长度估算 |
@@ -53,6 +54,48 @@ WorkBuddy 的 jsonl 每轮调用都带真实 `usage`，但有两个坑：
 不要用 `session_usage.credit_json` 折算 token：那是**费用**字段（元），
 与 token 的比值随模型费率浮动（实测 0.31x ~ 12.43x），且约 65% 的会话该字段为 NULL。
 
+### 没有 CC Switch 也能抓（Codex / Claude Code）
+
+**本项目的 codex / claude 采集不依赖 CC Switch。** 两套采集器自动切换、静默共存：
+
+| 本机状态 | 实际采集器 | 数据源 |
+| --- | --- | --- |
+| 装了 CC Switch（存在 `~/.cc-switch/cc-switch.db`） | `plugins/ccswitch.py` | 代理库明细 + 长期汇总 |
+| **没装 CC Switch**（朋友机器 / 已卸载） | `plugins/codex.py` + `plugins/claude.py` | **直接解析本地会话文件** |
+
+判据就是「文件存不存在」，无需任何配置。原生插件在 CC 在岗时**默认静默**（不产出任何行），
+避免同一份数据被两个插件重复计数；设 `AGENT_USAGE_FORCE_NATIVE=1` 可强制启用（此时建议同时禁用 ccswitch）。
+
+**为什么能替代**：CC Switch 本身就是「解析本地会话文件」的 —— 它的
+`proxy_request_logs.data_source` 字段值就是 `codex_session` / `session_log`，
+`request_id` 形如 `codex_session:<sid>:<seq>`。实测 CC 的 26397 条 codex 明细行
+**99.94% 精确命中本地 rollout 文件**、431 条 claude 行 **100% 命中本地 `message.id`**。
+所以它不产生数据，只是转发本地数据；我们照做即可。
+
+**原生采集口径**：
+
+- **Codex**：`~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`，
+  逐轮累加 `event_msg.payload.info.last_token_usage`（**增量**；
+  `total_token_usage` 是累计值，跨文件会重复，不能用）。
+  ⚠️ `ordinal` 是**文件内**序号（多个文件都从 ord=15 重起），**绝不能单独作去重键**；
+  判重必须 `(session_id, ordinal, 四 token 值)` 全同。
+- **Claude Code**：`~/.claude/projects/<编码路径>/<uuid>.jsonl`（含 `subagents/agent-*.jsonl`），
+  累加 `message.usage`，**必须按 `message.id` 去重**（同一条回复会因流式/重试落盘多行，
+  不去重虚高 2 倍以上）。
+
+**实测对比**（同一台机器）：
+
+| | 原生本地采集 | CC Switch | 结果 |
+| --- | --- | --- | --- |
+| Codex | **358.8 亿** | 266.1 亿 | 原生多 **34.8%**——CC 只覆盖 32 个会话，本地有 237 个（漏采 84%） |
+| Claude Code | 6.40 亿 | 6.40 亿 | **基本一致**（人机验证口径吻合） |
+
+即：**没有 CC Switch 不但能抓，Codex 还抓得更全。**
+
+> rollup 兜底：若本机残留过 `cc-switch.db`（哪怕后来卸载），其 `usage_daily_rollups`
+> 长期汇总表仍可用来补本地文件已清掉的历史差额（独立 `source_file` 前缀 `#rollup` 隔离，绝不与本地行相加）。
+> 全新机器没有这份兜底，只能采本地文件现有的范围——这是正常且正确的行为。
+
 ### CC Switch 口径说明（踩坑记录）
 
 CC Switch 的源库 `~/.cc-switch/cc-switch.db` 是**双表互补**设计，两张表**都必须读**：
@@ -69,7 +112,12 @@ CC Switch 的源库 `~/.cc-switch/cc-switch.db` 是**双表互补**设计，两�
 另外：proxy 的 `session_id` 粒度 ≠ Codex 真正的会话粒度——同一个会话可能先后用多个模型
 （如 `gpt-5.6-sol` 切到 `gpt-6-sol`）共享同一 `session_id`。**聚合粒度必须到
 `(agent, session_id, model)`**，否则只按 `(agent, session_id)` 聚合会让后来的模型覆盖先前的，
-早期模型类型（如 `gpt-6-sol`）整个消失。
+早期模型类型（如 `gpt-6-sol`）整个消失。**原生插件与 ccswitch 插件同此口径。**
+
+**跨来源清理一致性**：`engine/common.py` 的 `codex_daily_files()` / `claude_daily_files()`
+返回「该 agent 名下所有可能的 `source_file` 全集」（本地 root、CC 库、CC 库 `#rollup`），
+原生插件与 ccswitch 插件**共用同一份清单**。这样无论从「无 CC」切到「装 CC」还是反向卸载，
+引擎都会先把两侧的历史行全部清掉再写，不会出现两条曲线叠加的重复计数。
 
 ## 豆包工作插件
 
